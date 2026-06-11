@@ -62,12 +62,10 @@ pub const Chat = struct {
 
     pub const RunOnceOptions = struct {
         profile: bool = false,
+        image: ?[]const u8 = null,
     };
 
     pub fn runOnce(self: *Chat, prompt: []const u8, opts: RunOnceOptions) !void {
-        const prompt_tokens = try self.session.tokenizePrompt(self.allocator, prompt);
-        defer self.allocator.free(prompt_tokens);
-
         var stdout = std.Io.File.stdout().writerStreaming(self.io, &.{});
         var profiler: ?zml.Platform.Profiler = null;
         defer if (profiler) |*p| p.deinit();
@@ -85,8 +83,27 @@ pub const Chat = struct {
             try profiler.?.start();
         }
 
-        try self.runPrefill(prompt_tokens, &stdout.interface);
-        try self.runDecodeTurn(&stdout.interface);
+        if (opts.image) |image_path| {
+            const image_bytes = try readImageFile(self.allocator, self.io, image_path);
+            defer self.allocator.free(image_bytes);
+
+            var pending_image = try self.session.preprocessImage(self.allocator, image_bytes);
+            defer pending_image.deinit(self.allocator);
+
+            const prompt_tokens = try self.session.tokenizePromptMultimodal(self.allocator, prompt, pending_image);
+            defer self.allocator.free(prompt_tokens);
+
+            try self.runPrefillMultimodal(prompt_tokens, pending_image, &stdout.interface);
+            try self.runDecodeTurn(&stdout.interface);
+        } else {
+            const prompt_tokens = try self.session.tokenizePrompt(self.allocator, prompt);
+            defer self.allocator.free(prompt_tokens);
+
+            try self.runPrefill(prompt_tokens, &stdout.interface);
+            try self.runDecodeTurn(&stdout.interface);
+        }
+
+
         _ = if (profiler) |*p| try p.stop() else null;
 
         try stdout.interface.flush();
@@ -126,6 +143,20 @@ pub const Chat = struct {
 
         try self.tokens.appendSlice(self.allocator, prompt_tokens);
         try self.session.runPrefill(self.tokens.items);
+
+        try stdout.writeAll("\r          \r");
+        try stdout.flush();
+    }
+
+    fn runPrefillMultimodal(self: *Chat, prompt_tokens: []const u32, pp_image: models.PreprocessedImage, stdout: *std.Io.Writer) !void {
+        if (prompt_tokens.len + self.tokens.items.len > self.session.maxTokens()) {
+            return error.PromptTooLong;
+        }
+        try stdout.writeAll("\x1b[2mprefill...\x1b[0m");
+        try stdout.flush();
+
+        try self.tokens.appendSlice(self.allocator, prompt_tokens);
+        try self.session.runPrefillMultimodal(self.tokens.items, pp_image);
 
         try stdout.writeAll("\r          \r");
         try stdout.flush();
@@ -171,4 +202,12 @@ fn tokensPerSecond(duration: std.Io.Duration, tokens: u64) f64 {
     const seconds = @as(f64, @floatFromInt(duration.toNanoseconds())) / 1e9;
     if (seconds <= 0) return 0;
     return @as(f64, @floatFromInt(tokens)) / seconds;
+}
+
+fn readImageFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var dir = std.Io.Dir.cwd();
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+    var r = f.reader(io, &.{});
+    return r.interface.readAlloc(allocator, try f.length(io));
 }

@@ -9,6 +9,7 @@ pub const SessionOptions = struct {
 
 pub const GenerationOptions = struct {
     sampling_strategy: zml.nn.SamplingStrategy = .{},
+    max_patches: u32 = 1024, // For VL models
 };
 
 pub const Phase = enum {

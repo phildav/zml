@@ -1,0 +1,12 @@
+pub const inference = @import("qwen3_vl/inference.zig");
+pub const CompilationParameters = inference.CompilationParameters;
+pub const CompilationOptions = inference.CompilationParameters;
+pub const CompiledModel = inference.CompiledModel;
+pub const model = @import("qwen3_vl/model.zig");
+pub const Config = model.Config;
+pub const Buffers = model.Buffers;
+pub const Model = model.Model;
+pub const LoadedModel = model.LoadedModel;
+pub const session = @import("qwen3_vl/session.zig");
+pub const Session = session.Session;
+pub const PreprocessedImage = session.PreprocessedImage;

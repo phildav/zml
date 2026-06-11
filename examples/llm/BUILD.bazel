@@ -10,7 +10,7 @@ zig_binary(
     srcs = glob(["**/*.zig"]),
     main = "main.zig",
     visibility = ["//visibility:public"],
-    deps = ["//zml", "@linenoise"],
+    deps = ["//zml", "@linenoise", "@zigimg"],
 )
 
 zig_binary(

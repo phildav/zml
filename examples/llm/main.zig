@@ -16,6 +16,7 @@ const log = std.log.scoped(.llm);
 const Args = struct {
     model: []const u8,
     prompt: ?[]const u8 = null,
+    image: ?[]const u8 = null,
     seqlen: u32 = 2048,
     topk: u32 = 4,
     backend: ?zml.attention.attention.Backend = null,
@@ -30,6 +31,7 @@ const Args = struct {
         \\ Options:
         \\   --model=<path>      Path to the model repository (required)
         \\   --prompt=<string>   Prompt to use for generation (default: none)
+        \\   --image=<path>      Path to the image to use for generation (default: none)
         \\   --seqlen=<number>   Sequence length (default: 2048)
         \\   --topk=<number>     Top-k sampling cutoff (default: 4)
         \\   --backend=<text>    Attention backend to use ([vanilla, attnd, cuda_fa2, cuda_fa3], default: auto-selection)
@@ -169,6 +171,7 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try llm_chat.runOnce(prompt, .{
             .profile = args.profile,
+            .image = args.image,
         });
     }
 }

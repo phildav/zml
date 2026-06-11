@@ -10,6 +10,7 @@ pub const lfm2 = @import("models/lfm2.zig");
 pub const llama = @import("models/llama.zig");
 pub const qwen3_5 = @import("models/qwen3_5.zig");
 pub const qwen3_5_moe = @import("models/qwen3_5_moe.zig");
+pub const qwen3_vl = @import("models/qwen3_vl.zig");
 
 const log = std.log.scoped(.llm);
 
@@ -18,17 +19,21 @@ pub const ModelType = enum {
     llama,
     qwen3_5,
     qwen3_5_moe,
+    qwen3_vl,
 };
 
 const RawConfig = struct {
     model_type: []const u8,
 };
 
+pub const PreprocessedImage = qwen3_vl.PreprocessedImage;
+
 pub const LoadedModel = union(ModelType) {
     lfm2: lfm2.LoadedModel,
     llama: llama.LoadedModel,
     qwen3_5: qwen3_5.LoadedModel,
     qwen3_5_moe: qwen3_5_moe.LoadedModel,
+    qwen3_vl: qwen3_vl.LoadedModel,
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -45,6 +50,7 @@ pub const LoadedModel = union(ModelType) {
             .llama => .{ .llama = try llama.LoadedModel.init(allocator, io, repo, store, generation) },
             .qwen3_5 => .{ .qwen3_5 = try qwen3_5.LoadedModel.init(allocator, io, repo, store, generation) },
             .qwen3_5_moe => .{ .qwen3_5_moe = try qwen3_5_moe.LoadedModel.init(allocator, io, repo, store, generation) },
+            .qwen3_vl => .{ .qwen3_vl = try qwen3_vl.LoadedModel.init(allocator, io, repo, store, generation) },
         };
     }
 
@@ -60,6 +66,7 @@ pub const LoadedModel = union(ModelType) {
             .llama => |*m| .{ .llama = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
             .qwen3_5 => |*m| .{ .qwen3_5 = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
             .qwen3_5_moe => |*m| .{ .qwen3_5_moe = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
+            .qwen3_vl => |*m| .{ .qwen3_vl = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
         };
     }
 
@@ -79,6 +86,10 @@ pub const LoadedModel = union(ModelType) {
             },
             .qwen3_5_moe => |*loaded_model| switch (buffers.*) {
                 .qwen3_5_moe => |*loaded_buffers| loaded_model.unloadBuffers(loaded_buffers, allocator),
+                else => unreachable,
+            },
+            .qwen3_vl => |*loaded_model| switch (buffers.*) {
+                .qwen3_vl => |*loaded_buffers| loaded_model.unloadBuffers(loaded_buffers, allocator),
                 else => unreachable,
             },
         }
@@ -131,6 +142,15 @@ pub const LoadedModel = union(ModelType) {
                 seqlen,
                 progress,
             ) },
+            .qwen3_vl => |*m| .{ .qwen3_vl = try m.compile(
+                allocator,
+                io,
+                platform,
+                backend,
+                shardings,
+                seqlen,
+                progress,
+            ) },
         };
         return .{
             .inner = inner,
@@ -145,6 +165,7 @@ pub const CompiledModel = struct {
         llama: llama.inference.CompiledModel,
         qwen3_5: qwen3_5.inference.CompiledModel,
         qwen3_5_moe: qwen3_5_moe.inference.CompiledModel,
+        qwen3_vl: qwen3_vl.inference.CompiledModel,
     };
 
     inner: Inner,
@@ -156,6 +177,7 @@ pub const CompiledModel = struct {
             .llama => |*b| b.deinit(),
             .qwen3_5 => |*b| b.deinit(),
             .qwen3_5_moe => |*b| b.deinit(),
+            .qwen3_vl => |*b| b.deinit(),
         }
     }
 
@@ -212,6 +234,17 @@ pub const CompiledModel = struct {
                 ) },
                 .seqlen = self.seqlen,
             },
+            .qwen3_vl => |*compiled| .{ 
+                .inner = .{ .qwen3_vl = try qwen3_vl.Session.init(
+                    allocator,
+                    io,
+                    platform,
+                    tokenizer,
+                    compiled,
+                    &model_buffers.qwen3_vl,
+                ) },
+                .seqlen = self.seqlen,
+            },
         };
     }
 };
@@ -221,6 +254,7 @@ pub const Buffers = union(ModelType) {
     llama: llama.Buffers,
     qwen3_5: qwen3_5.Buffers,
     qwen3_5_moe: qwen3_5_moe.Buffers,
+    qwen3_vl: qwen3_vl.Buffers,
 };
 
 pub const Session = struct {
@@ -229,6 +263,7 @@ pub const Session = struct {
         llama: llama.Session,
         qwen3_5: qwen3_5.Session,
         qwen3_5_moe: qwen3_5_moe.Session,
+        qwen3_vl: qwen3_vl.Session,
     };
 
     inner: Inner,
@@ -246,6 +281,13 @@ pub const Session = struct {
         };
     }
 
+    pub fn runPrefillMultimodal(self: *Session, all_tokens: []const u32, pp_image: PreprocessedImage) !void {
+        try switch (self.inner) {
+            .qwen3_vl => |*s| s.runPrefillMultimodal(all_tokens, pp_image),
+            else => error.MultimodalNotSupported,
+        };
+    }
+
     pub fn runDecode(self: *Session, all_tokens: *std.ArrayList(u32), writer: *std.Io.Writer) !void {
         try switch (self.inner) {
             inline else => |*s| s.runDecode(all_tokens, writer),
@@ -258,6 +300,18 @@ pub const Session = struct {
         };
     }
 
+    pub fn tokenizePromptMultimodal(
+        self: *const Session,
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        image: qwen3_vl.PreprocessedImage,
+    ) ![]const u32 {
+        return switch (self.inner) {
+            .qwen3_vl => |*s| s.tokenizePromptMultimodal(allocator, prompt, image),
+            else => error.MultimodalNotSupported,
+        };
+    }
+
     pub fn tokenizeTurn(self: *const Session, allocator: std.mem.Allocator, prompt: []const u8) ![]const u32 {
         return switch (self.inner) {
             inline else => |*s| s.tokenizeTurn(allocator, prompt),
@@ -266,6 +320,13 @@ pub const Session = struct {
 
     pub fn maxTokens(self: *const Session) u32 {
         return self.seqlen;
+    }
+
+    pub fn preprocessImage(self: *const Session, allocator: std.mem.Allocator, bytes: []const u8) !PreprocessedImage {
+        return switch (self.inner) {
+            .qwen3_vl => |*s| s.preprocessImage(allocator, bytes),
+            else => error.MultimodalNotSupported,
+        };
     }
 };
 
