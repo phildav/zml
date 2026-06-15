@@ -17,25 +17,22 @@ pub const Session = struct {
     model_buffers: *model.Buffers,
     compiled_model: *const inference.CompiledModel,
 
-    // Persistent KV, Rng state
     kv_cache_buffers: zml.Bufferized(model.KvCache),
     rng_buffers: zml.Bufferized(zml.Tensor.Rng),
 
-    // Pre-baked decode args
-    decode_args: zml.exe.Exe.Arguments,
-    decode_results: zml.exe.Exe.Results,
+    decode_runner: inference.KernelExe.Runner,
 
     tokenizer: zml.tokenizer.Tokenizer,
+    generated_token_buf: zml.Buffer,
     generated_token_slice: zml.Slice,
+    decode_last_real_pos_buf: zml.Buffer,
     seqlen: u32,
     eos_token_id: u32,
     special_tokens: model.Model.SpecialTokens,
     think_start: ?u32,
     think_end: ?u32,
 
-    // Visual
     max_n_visual: u32,
-    // mRoPE position to assign to the first decoded text token. Set by runPrefill
     next_decode_pos: u32 = 0,
 
     pub fn init(
@@ -50,12 +47,20 @@ pub const Session = struct {
         errdefer model.KvCache.deinitBuffer(&kv_cache_buffers);
 
         const seed: u128 = @intCast(std.Io.Clock.now(.real, io).toNanoseconds());
+        var rng_buffers = try zml.Tensor.Rng.initBuffer(io, platform, .replicated, seed);
+        errdefer zml.Tensor.Rng.deinitBuffer(&rng_buffers);
 
-        var dec_args = try compiled_model.decode_exe.args(allocator);
-        errdefer dec_args.deinit(allocator);
-        dec_args.bake(model_buffers.*);
-        var dec_results = try compiled_model.decode_exe.results(allocator);
-        errdefer dec_results.deinit(allocator);
+        var decode_runner = try compiled_model.decode.initRunner(allocator, io, platform, model_buffers);
+        errdefer decode_runner.deinit(allocator);
+
+        var generated_token_buf = try zml.Buffer.uninitialized(io, platform, compiled_model.params.decode_token.shape(), .replicated, .{});
+        errdefer generated_token_buf.deinit();
+
+        const generated_token_slice = try zml.Slice.alloc(allocator, compiled_model.params.decode_token.shape());
+        errdefer generated_token_slice.free(allocator);
+
+        var decode_last_real_pos_buf = try zml.Buffer.scalar(io, platform, @as(u32, 0), .u32);
+        errdefer decode_last_real_pos_buf.deinit();
 
         return .{
             .allocator = allocator,
@@ -64,11 +69,12 @@ pub const Session = struct {
             .model_buffers = model_buffers,
             .compiled_model = compiled_model,
             .kv_cache_buffers = kv_cache_buffers,
-            .rng_buffers = try zml.Tensor.Rng.initBuffer(io, platform, .replicated, seed),
-            .decode_args = dec_args,
-            .decode_results = dec_results,
+            .rng_buffers = rng_buffers,
+            .decode_runner = decode_runner,
             .tokenizer = tokenizer,
-            .generated_token_slice = try .alloc(allocator, compiled_model.params.decode_token.shape()),
+            .generated_token_buf = generated_token_buf,
+            .generated_token_slice = generated_token_slice,
+            .decode_last_real_pos_buf = decode_last_real_pos_buf,
             .seqlen = compiled_model.params.max_seqlen,
             .eos_token_id = compiled_model.loaded_model.inner.special_tokens.im_end_token_id,
             .special_tokens = compiled_model.loaded_model.inner.special_tokens,
@@ -81,9 +87,10 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         model.KvCache.deinitBuffer(&self.kv_cache_buffers);
         zml.Tensor.Rng.deinitBuffer(&self.rng_buffers);
+        self.decode_runner.deinit(self.allocator);
+        self.generated_token_buf.deinit();
         self.generated_token_slice.free(self.allocator);
-        self.decode_args.deinit(self.allocator);
-        self.decode_results.deinit(self.allocator);
+        self.decode_last_real_pos_buf.deinit();
     }
 
     pub fn tokenizePrompt(self: *const Session, allocator: std.mem.Allocator, prompt: []const u8) ![]const u32 {
@@ -142,7 +149,7 @@ pub const Session = struct {
         @memcpy(prefill_tokens[0..all_tokens.len], all_tokens);
 
         const replicated_sharding: zml.Sharding = .replicated;
-        
+
         var prefill_tokens_buf: zml.Buffer = try .fromSlice(self.io, self.platform, prefill_tokens_slice, replicated_sharding);
         defer prefill_tokens_buf.deinit();
 
@@ -235,35 +242,37 @@ pub const Session = struct {
 
             const VisionReturn = zml.Bufferized(zml.stdx.meta.FnReturn(model.VisionModel.paddedVisionForward));
             const vis_out = vis_results.get(VisionReturn);
-            visual_embeds_buf.deinit(); visual_embeds_buf = vis_out[0];
-            deepstack_buf_0.deinit();   deepstack_buf_0   = vis_out[1];
-            deepstack_buf_1.deinit();   deepstack_buf_1   = vis_out[2];
-            deepstack_buf_2.deinit();   deepstack_buf_2   = vis_out[3];
+            visual_embeds_buf.deinit();
+            visual_embeds_buf = vis_out[0];
+            deepstack_buf_0.deinit();
+            deepstack_buf_0 = vis_out[1];
+            deepstack_buf_1.deinit();
+            deepstack_buf_1 = vis_out[2];
+            deepstack_buf_2.deinit();
+            deepstack_buf_2 = vis_out[3];
         }
 
-        var pf_args = try self.compiled_model.prefill_exe.args(self.allocator);
-        defer pf_args.deinit(self.allocator);
-        pf_args.bake(self.model_buffers.*);
-        var pf_results = try self.compiled_model.prefill_exe.results(self.allocator);
-        defer pf_results.deinit(self.allocator);
-
         log.info("running prefill...", .{});
-        pf_args.set(.{
-            prefill_tokens_buf, position_ids_buf,
-            visual_embeds_buf, [3]zml.Buffer{ deepstack_buf_0, deepstack_buf_1, deepstack_buf_2 },
-            visual_scatter_idx_buf, token_index_buf, last_real_pos_buf,
-            self.kv_cache_buffers, self.rng_buffers,
+        try self.compiled_model.prefill.run(.{
+            .allocator = self.allocator,
+            .io = self.io,
+            .platform = self.platform,
+            .model_buffers = self.model_buffers,
+            .tokens_buf = &prefill_tokens_buf,
+            .position_ids_buf = &position_ids_buf,
+            .token_index_buf = &token_index_buf,
+            .last_real_pos_buf = &last_real_pos_buf,
+            .generated_token_buf = &self.generated_token_buf,
+            .kv_cache_buffers = &self.kv_cache_buffers,
+            .rng_buffers = &self.rng_buffers,
+            .visual_embeds_buf = &visual_embeds_buf,
+            .visual_scatter_idx_buf = &visual_scatter_idx_buf,
+            .deepstack_bufs = .{ &deepstack_buf_0, &deepstack_buf_1, &deepstack_buf_2 },
         });
-        self.compiled_model.prefill_exe.callOpts(self.io, pf_args, &pf_results, .{ .wait = true });
 
-        const PrefillReturn = zml.Bufferized(zml.stdx.meta.FnReturn(model.Model.prefill));
-        var pf_out = pf_results.get(PrefillReturn);
-        defer pf_out[0].deinit();
-        self.kv_cache_buffers = pf_out[1]; // reuseBuffer: same backing memory, just update struct
-        self.rng_buffers = pf_out[2];      // reuseBuffer: same backing memory, just update struct
         self.next_decode_pos = @intCast(position_ids_slice.items(i64)[all_tokens.len - 1] + 1);
 
-        const next_token = try pf_out[0].getValue(u32, self.io);
+        const next_token = try self.generated_token_buf.getValue(u32, self.io);
         self.generated_token_slice.items(u32)[0] = next_token;
     }
 
@@ -274,9 +283,6 @@ pub const Session = struct {
         const out_tokens_buffer: []u8 = try self.allocator.alloc(u8, 1024);
         defer self.allocator.free(out_tokens_buffer);
         const replicated_sharding: zml.Sharding = .replicated;
-
-        var current_token_buffer = try zml.Buffer.fromSlice(self.io, self.platform, self.generated_token_slice, replicated_sharding);
-        defer current_token_buffer.deinit();
 
         var token_index_buffer = try zml.Buffer.scalar(self.io, self.platform, @as(u32, @intCast(all_tokens.items.len)), .u32);
         defer token_index_buffer.deinit();
@@ -300,45 +306,37 @@ pub const Session = struct {
             try all_tokens.append(self.allocator, token_id);
             if (all_tokens.items.len >= self.seqlen) break :generation;
 
-            // Build per-step decode_position_ids.
             const pos_arr = [_]i64{ decode_pos, decode_pos, decode_pos };
             var decode_pos_buf = try zml.Buffer.fromBytes(
-                self.io, self.platform,
+                self.io,
+                self.platform,
                 self.compiled_model.params.decode_position_ids.shape(),
                 replicated_sharding,
                 std.mem.sliceAsBytes(&pos_arr),
             );
             defer decode_pos_buf.deinit();
 
-            self.decode_args.set(.{
-                &current_token_buffer,
-                &decode_pos_buf,
-                &token_index_buffer,
-                &self.kv_cache_buffers,
-                &self.rng_buffers,
+            try self.decode_runner.run(.{
+                .allocator = self.allocator,
+                .io = self.io,
+                .platform = self.platform,
+                .model_buffers = self.model_buffers,
+                .tokens_buf = &self.generated_token_buf,
+                .position_ids_buf = &decode_pos_buf,
+                .token_index_buf = &token_index_buffer,
+                .last_real_pos_buf = &self.decode_last_real_pos_buf,
+                .generated_token_buf = &self.generated_token_buf,
+                .kv_cache_buffers = &self.kv_cache_buffers,
+                .rng_buffers = &self.rng_buffers,
+                .visual_embeds_buf = undefined,
+                .visual_scatter_idx_buf = undefined,
+                .deepstack_bufs = undefined,
             });
-            self.compiled_model.decode_exe.call(self.decode_args, &self.decode_results);
 
-            var new_tok, const new_kv, const new_rng = self.decode_results.get(struct {
-                zml.Buffer,
-                zml.Bufferized(model.KvCache),
-                zml.Bufferized(zml.Tensor.Rng),
-            });
-
-            // Aliasing: kv and rng share storage with inputs; no deinit before reassign.
-            self.kv_cache_buffers = new_kv;
-            self.rng_buffers = new_rng;
-
-            // current_token_buf and new_tok may also alias (decode reuses tokens_buf).
-            // Replace the handle without deinit if they share storage.
-            replaceBuffer(&current_token_buffer, &new_tok);
-
-            try current_token_buffer.toSlice(self.io, self.generated_token_slice);
+            try self.generated_token_buf.toSlice(self.io, self.generated_token_slice);
 
             decode_pos += 1;
-            // Update token_index_buf for next iter:
-            const new_idx = try zml.Buffer.scalar(self.io, self.platform,
-                @as(u32, @intCast(all_tokens.items.len)), .u32);
+            const new_idx = try zml.Buffer.scalar(self.io, self.platform, @as(u32, @intCast(all_tokens.items.len)), .u32);
             token_index_buffer.deinit();
             token_index_buffer = new_idx;
         }
@@ -348,21 +346,19 @@ pub const Session = struct {
     }
 
     pub fn preprocessImage(self: *const Session, allocator: std.mem.Allocator, bytes: []const u8) !PreprocessedImage {
-      const vcfg = self.compiled_model.loaded_model.parsed_config.value.vision_config;
-      return try image.preprocess(
-          allocator,
-          bytes,
-          self.compiled_model.params.max_patches,
-          vcfg.patch_size,
-          vcfg.temporal_patch_size,
-          vcfg.in_channels,
-          vcfg.spatial_merge_size,
-      );
-  }
+        const vcfg = self.compiled_model.loaded_model.parsed_config.value.vision_config;
+        return try image.preprocess(
+            allocator,
+            bytes,
+            self.compiled_model.params.max_patches,
+            vcfg.patch_size,
+            vcfg.temporal_patch_size,
+            vcfg.in_channels,
+            vcfg.spatial_merge_size,
+        );
+    }
 };
 
-// Fill a [3, max_seqlen] i64 position-ID slice (row-major: row*max_seqlen+col).
-// Prefix: T=H=W = sequential; Visual: 2-D mRoPE grid; Suffix + padding: sequential.
 fn buildPositionIdsSlice(
     out: []i64,
     max_seqlen: usize,
@@ -405,22 +401,6 @@ fn findFirstToken(tokens: []const u32, id: u32) error{MissingToken}!usize {
     return error.MissingToken;
 }
 
-fn replaceBuffer(dst: *zml.Buffer, src: *zml.Buffer) void {
-    if (!sameBufferHandle(dst.*, src.*)) {
-        dst.deinit();
-    }
-    dst.* = src.*;
-}
-
-fn sameBufferHandle(a: zml.Buffer, b: zml.Buffer) bool {
-    if (a._shards.len != b._shards.len) return false;
-    for (a._shards.constSlice(), b._shards.constSlice()) |a_shard, b_shard| {
-        if (a_shard != b_shard) return false;
-    }
-    return true;
-}
-
-
 fn tokenizeChatPromptVisual(
     allocator: std.mem.Allocator,
     tokenizer: zml.tokenizer.Tokenizer,
@@ -434,9 +414,9 @@ fn tokenizeChatPromptVisual(
 
     const im_start = tokenizer.tokenId("<|im_start|>") orelse special_tokens.im_start_token_id;
     const im_end = tokenizer.tokenId("<|im_end|>") orelse special_tokens.im_end_token_id;
-    const vstart   = tokenizer.tokenId("<|vision_start|>") orelse special_tokens.vision_start_token_id;
-    const vend     = tokenizer.tokenId("<|vision_end|>") orelse special_tokens.vision_end_token_id;
-    const ipad     = tokenizer.tokenId("<|image_pad|>") orelse special_tokens.image_pad_token_id;
+    const vstart = tokenizer.tokenId("<|vision_start|>") orelse special_tokens.vision_start_token_id;
+    const vend = tokenizer.tokenId("<|vision_end|>") orelse special_tokens.vision_end_token_id;
+    const ipad = tokenizer.tokenId("<|image_pad|>") orelse special_tokens.image_pad_token_id;
     const newline = tokenizer.tokenId("\\n") orelse return error.NoSuchToken;
 
     var tokens: std.ArrayList(u32) = try .initCapacity(allocator, 128);

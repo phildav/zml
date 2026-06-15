@@ -204,54 +204,6 @@ pub const Model = struct {
         if (self.lm_head.bias) |*b| b.deinit();
     }
 
-    // Padded prefill kernel — compiled once at max_seqlen.
-    // Handles both text-only (n_visual_actual=0) and multimodal
-    pub fn prefill(
-        self: Model,
-        tokens: zml.Tensor,                // [.s = max_seqlen]
-        position_ids: zml.Tensor,          // [.mrope = 3, .s = max_seqlen]
-        visual_embeds: zml.Tensor,         // [.n = max_n_visual, .d]
-        deepstack: [3]zml.Tensor,          // [.n = max_n_visual, .d]
-        visual_scatter_idx: zml.Tensor,    // [.n = max_n_visual]
-        token_index: zml.Tensor,           // [] u32 — KV slot (0 for prefill)
-        last_real_pos: zml.Tensor,         // [] u32 — position to sample at
-        kv_cache: KvCache,
-        rng: zml.Tensor.Rng,
-    ) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
-        // Embed the full (padded) token sequence.
-        var embeds = self.text_model.embedTokens(tokens);
-
-        // Scatter visual embeddings into embed positions given by visual_scatter_idx.
-        embeds = embeds.scatterSlices(
-            .{ .s = visual_scatter_idx },
-            visual_embeds,
-            .{ .update_fn = zml.Tensor.ScatterOpts.override },
-        );
-
-        const hidden, const updated_kv = self.text_model.prefill(
-            embeds, position_ids, token_index, kv_cache, deepstack, visual_scatter_idx,
-        );
-
-        const next_token, const new_rng = self.sampler().sampleTokens(hidden, rng, last_real_pos);
-        return .{ next_token, updated_kv, new_rng };
-    }
-
-    pub fn forward(
-        self: Model,
-        token: zml.Tensor,         // [.s=1] u32
-        position_ids: zml.Tensor,  // [.mrope=3, .s=1] i64
-        token_index: zml.Tensor,   // [] u32 — KV slot
-        kv_cache: KvCache,
-        rng: zml.Tensor.Rng,
-    ) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
-        const embeds = self.text_model.embedTokens(token);
-        const x, const updated_kv = self.text_model.forward(embeds, position_ids, token_index, kv_cache);
-        // Decode has s=1; last_real_pos=0 is always the only position.
-        const last_pos = zml.Tensor.scalar(@as(u32, 0), .u32);
-        const next_token, const new_rng = self.sampler().sampleTokens(x, rng, last_pos);
-        return .{ next_token, updated_kv, new_rng };
-    }
-
     pub fn sampler(self: Model) Sampler {
         return .{
             .norm = self.text_model.norm,
@@ -313,52 +265,6 @@ pub const TextModel = struct {
         }
         allocator.free(self.layers);
         RmsNorm.unloadBuffers(&self.norm);
-    }
-
-    pub fn embedTokens(self: TextModel, tokens: zml.Tensor) zml.Tensor {
-        return self.embed_tokens.weight.gather(.{ .voc = tokens }, .{});
-    }
-
-    pub fn prefill(
-        self: TextModel,
-        embeds: zml.Tensor,                // [.s = max_seqlen, .d]
-        position_ids: zml.Tensor,          // [.mrope = 3, .s = max_seqlen]
-        token_index: zml.Tensor,           // [] u32
-        kv_cache: KvCache,
-        deepstack: [3]zml.Tensor,          // [.n = max_n_visual, .d] — zero rows for padding
-        visual_scatter_idx: zml.Tensor,    // [.n = max_n_visual] i32 — sink trick applied
-    ) struct { zml.Tensor, KvCache } {
-        // Transformer with deepstack
-        var x = embeds;
-        var updated_kv = kv_cache;
-        for (self.layers, 0..) |layer, i| {
-            x, updated_kv = layer.forward(x, position_ids, token_index, updated_kv.atLayer(i));
-            if (i < 3) {
-                x = x.scatterSlices(
-                    .{ .s = visual_scatter_idx },
-                    deepstack[i],
-                    .{ .update_fn = zml.Tensor.ScatterOpts.increment },
-                );
-            }
-        }
-        updated_kv = updated_kv.reuseBuffer(kv_cache);
-        return .{ x, updated_kv };
-    }
-
-    pub fn forward(
-        self: TextModel,
-        embeds: zml.Tensor,         // [.s = 1, .d]
-        position_ids: zml.Tensor,    // [.mrope = 3, .s = 1]
-        token_index: zml.Tensor,     // [] u32 — KV slot
-        kv_cache: KvCache,
-    ) struct { zml.Tensor, KvCache } {
-        var x = embeds;
-        var updated_kv = kv_cache;
-        for (self.layers, 0..) |layer, i| {
-            x, updated_kv = layer.forward(x, position_ids, token_index, updated_kv.atLayer(i));
-        }
-        updated_kv = updated_kv.reuseBuffer(kv_cache);
-        return .{ x, updated_kv };
     }
 
 };
