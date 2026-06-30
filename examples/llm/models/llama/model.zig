@@ -550,6 +550,7 @@ const SelfAttn = struct {
             k,
             v,
             token_index,
+            .{},
             layer_attention_metadata,
             attention_parameters,
         );

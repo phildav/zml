@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdx = @import("stdx");
 
 const zml = @import("../zml.zig");
 const attnd = @import("attnd.zig");
@@ -6,6 +7,10 @@ const flashattn = @import("flashattn.zig");
 const nki = @import("nki/attention.zig");
 
 const Attention = @This();
+
+pub const AttentionOptions = struct {
+    is_causal: bool = true,
+};
 
 pub const Backend = enum {
     vanilla,
@@ -156,24 +161,32 @@ pub const Metadata = union(Backend) {
     }
 };
 
-pub fn attention(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.Tensor, metadata: Metadata, parameters: Parameters) zml.Tensor {
+pub fn attention(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.Tensor, opts: AttentionOptions, metadata: Metadata, parameters: Parameters) zml.Tensor {
     return switch (parameters) {
         .vanilla => b: {
-            // Generate the attention mask.
-            const seq_len = k.dim(.k);
-            var attn_mask = zml.nn.causalAttnMask(.{ .q = seq_len, .k = seq_len }, q.dtype(), null);
-
-            // Note: in Pytorch it would be very inefficient to generate the full attn_mask,
-            // then slice into it, but XLA is able to optimize this correctly.
-            attn_mask = attn_mask.gatherSlices(zml.Shape.init(.{ .q = q.dim(.q) }, attn_mask.dtype()), token_index.reshape(.{ .coord = 1 }), .{});
+            const attn_mask: ?zml.Tensor = if (opts.is_causal) m: {
+                // If causal, generate the attention mask
+                const seq_len = k.dim(.k);
+                var attn_mask = zml.nn.causalAttnMask(.{ .q = seq_len, .k = seq_len }, q.dtype(), null);
+                // Note: in Pytorch it would be very inefficient to generate the full attn_mask,
+                // then slice into it, but XLA is able to optimize this correctly.
+                break :m attn_mask.gatherSlices(zml.Shape.init(.{ .q = q.dim(.q) }, attn_mask.dtype()), token_index.reshape(.{ .coord = 1 }), .{});
+            } else null;
             const attn_output = zml.nn.sdpa(q, k, v, .{ .attn_mask = attn_mask, .allow_cudnn = true });
             break :b attn_output;
         },
-        .attnd => attnd.causalAttention(q, k, v, token_index, metadata.attnd, parameters.attnd),
-        .nki => |params| nki.attention(q, k, v, token_index, params),
-        .cuda_fa2 => flashattn.fa2.attention(q, k, v, token_index, metadata.cuda_fa2, parameters.cuda_fa2),
-        .cuda_fa3 => flashattn.fa3.attention(q, k, v, token_index, metadata.cuda_fa3, parameters.cuda_fa3),
+        .attnd => b: {
+            stdx.debug.assert(opts.is_causal, "attnd backend only supports causal attention", .{});
+            break :b attnd.causalAttention(q, k, v, token_index, metadata.attnd, parameters.attnd);
+        },
+        .nki => |params| b: {
+            stdx.debug.assert(opts.is_causal, "nki backend only supports causal attention", .{});
+            break :b nki.attention(q, k, v, token_index, params);
+        },
+        .cuda_fa2 => flashattn.fa2.attention(q, k, v, token_index, opts, metadata.cuda_fa2, parameters.cuda_fa2),
+        .cuda_fa3 => flashattn.fa3.attention(q, k, v, token_index,opts, metadata.cuda_fa3, parameters.cuda_fa3),
         .metal_fa => b: {
+            stdx.debug.assert(opts.is_causal, "metal_fa backend only supports causal attention", .{});
             const qc = q.transpose(.{ .h, .q, .hd });
             const kc = k.transpose(.{ .h, .k, .hd });
             const vc = v.transpose(.{ .h, .k, .hd });

@@ -526,6 +526,7 @@ pub const Attention = struct {
                 k,
                 v,
                 tokens_position_offset,
+                .{},
                 attention_metadata,
                 attention_parameters,
             ).merge(.{ .d = .{ .h, .hd } }),
@@ -534,6 +535,7 @@ pub const Attention = struct {
                 k.squeeze(.batch),
                 v.squeeze(.batch),
                 tokens_position_offset.squeeze(.batch),
+                .{},
                 attention_metadata,
                 attention_parameters,
             ).merge(.{ .d = .{ .h, .hd } })

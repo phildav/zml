@@ -7,7 +7,8 @@ const stdx = @import("stdx");
 const CompilationContext = @import("../module.zig").CompilationContext;
 const zml = @import("../zml.zig");
 const ffi = zml.pjrt.ffi;
-const AttentionOptions = @import("paged_attention.zig").AttentionOptions;
+const PagedAttentionOptions = @import("paged_attention.zig").AttentionOptions;
+const AttentionOptions = @import("attention.zig").AttentionOptions;
 
 const log = std.log.scoped(.@"zml/attention/flashattn");
 
@@ -265,7 +266,7 @@ pub const fa2 = struct {
         }
     };
 
-    pub fn attention(q_: zml.Tensor, k_: zml.Tensor, v_: zml.Tensor, token_index: zml.Tensor, metadata: Metadata, parameters: Parameters) zml.Tensor {
+    pub fn attention(q_: zml.Tensor, k_: zml.Tensor, v_: zml.Tensor, token_index: zml.Tensor, opts: AttentionOptions, metadata: Metadata, parameters: Parameters) zml.Tensor {
         const ctx = CompilationContext.current();
 
         stdx.debug.assert(q_.shape().hasTag(.b) == null or q_.dim(.b) == 1, "fa2.attention support for batch size != 1 is not supported yet.", .{});
@@ -320,7 +321,7 @@ pub const fa2 = struct {
                     const head_dim = q.shape().dim(2);
                     break :b 1.0 / std.math.sqrt(@as(f32, @floatFromInt(head_dim)));
                 },
-                .is_causal = true,
+                .is_causal = opts.is_causal,
                 .window_size_left = parameters.sliding_window,
                 .window_size_right = @as(i32, -1),
                 .max_seqlen_q = max_seqlen_q,
@@ -463,7 +464,7 @@ pub const fa3 = struct {
         }
     };
 
-    pub fn attention(q_: zml.Tensor, k_: zml.Tensor, v_: zml.Tensor, token_index: zml.Tensor, metadata: Metadata, _: Parameters) zml.Tensor {
+    pub fn attention(q_: zml.Tensor, k_: zml.Tensor, v_: zml.Tensor, token_index: zml.Tensor, opts: AttentionOptions, metadata: Metadata, _: Parameters) zml.Tensor {
         stdx.debug.assert(q_.shape().hasTag(.b) == null or q_.dim(.b) == 1, "fa3.attention support for batch size != 1 is not supported yet.", .{});
         const seqused_k = token_index.addConstant(q_.dim(.q)).reshape(.{1});
         // TODO(Corendos): replace with cumsum
@@ -495,7 +496,7 @@ pub const fa3 = struct {
             },
             .{q.shape()},
             .{
-                .is_causal = true,
+                .is_causal = opts.is_causal,
                 .window_size_left = @as(i32, -1),
                 .window_size_right = @as(i32, -1),
                 .max_seqlen_q = max_seqlen_q,
@@ -948,7 +949,7 @@ pub const paged_fa2 = struct {
         }
     };
 
-    pub fn pagedAttention(parameters: Parameters, q: zml.Tensor, k_cache: zml.Tensor, v_cache: zml.Tensor, opts: AttentionOptions) zml.Tensor {
+    pub fn pagedAttention(parameters: Parameters, q: zml.Tensor, k_cache: zml.Tensor, v_cache: zml.Tensor, opts: PagedAttentionOptions) zml.Tensor {
         stdx.debug.assert(q.shape().hasTags(.{ .b, .hg, .hkv, .hd }), "Expected q to have tags .b, .h, .hd", .{});
         stdx.debug.assert(k_cache.shape().hasTags(.{ .page, .k_chunk, .hkv, .hd }), "Expected paged_k to have tags .page, .k_chunk, .h, .hd, got {}", .{k_cache.shape()});
         stdx.debug.assert(v_cache.shape().hasTags(.{ .page, .k_chunk, .hkv, .hd }), "Expected paged_v to have tags .page, .k_chunk, .h, .hd. got {}", .{v_cache.shape()});
@@ -1639,7 +1640,7 @@ pub const paged_fa3 = struct {
         }
     };
 
-    pub fn pagedAttention(parameters: Parameters, q: zml.Tensor, k_cache: zml.Tensor, v_cache: zml.Tensor, opts: AttentionOptions) zml.Tensor {
+    pub fn pagedAttention(parameters: Parameters, q: zml.Tensor, k_cache: zml.Tensor, v_cache: zml.Tensor, opts: PagedAttentionOptions) zml.Tensor {
         stdx.debug.assert(q.shape().hasTags(.{ .b, .hg, .hkv, .hd }), "Expected q to have tags .b, .h, .hd", .{});
         stdx.debug.assert(k_cache.shape().hasTags(.{ .page, .k_chunk, .hkv, .hd }), "Expected paged_k to have tags .page, .k_chunk, .h, .hd, got {}", .{k_cache.shape()});
         stdx.debug.assert(v_cache.shape().hasTags(.{ .page, .k_chunk, .hkv, .hd }), "Expected paged_v to have tags .page, .k_chunk, .h, .hd. got {}", .{v_cache.shape()});

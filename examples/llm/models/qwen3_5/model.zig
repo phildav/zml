@@ -603,6 +603,7 @@ pub const SelfAttn = struct {
             k,
             v,
             token_index,
+            .{},
             zml.attention.attention.Metadata.init(.fromBackend(.vanilla, x.dim(.s), self.num_heads)),
             zml.attention.attention.Parameters.init(.fromBackend(.vanilla)),
         ).rename(.{ .q = .s }).merge(.{ .d_out_proj = .{ .h, .hd } });
