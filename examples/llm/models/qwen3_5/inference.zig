@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const zml = @import("zml");
+const attention = zml.attention.attention;
 
 const common = @import("../common.zig");
 const model = @import("model.zig");
@@ -14,10 +15,13 @@ pub const CompilationParameters = struct {
     token_index: zml.Tensor,
     kv_cache: model.KvCache,
     rng: zml.Tensor.Rng,
+    attention_metadata: attention.Metadata,
+    prefill_attention_parameters: attention.Parameters,
+    decode_attention_parameters: attention.Parameters,
     seqlen: u32,
     shardings: common.Shardings,
 
-    pub fn init(mdl: model.Model, config: model.Config, seqlen: u32, shardings: common.Shardings) CompilationParameters {
+    pub fn init(mdl: model.Model, config: model.Config, seqlen: u32, backend: attention.Backend, shardings: common.Shardings) CompilationParameters {
         const dtype = mdl.text_model.embed_tokens.weight.dtype();
         return .{
             .prefill_tokens = .init(.{ .b = 1, .s = seqlen }, .u32),
@@ -25,6 +29,9 @@ pub const CompilationParameters = struct {
             .token_index = .init(.{}, .u32),
             .kv_cache = .init(config, 1, seqlen, dtype, .f32, shardings.model),
             .rng = .init(),
+            .attention_metadata = .init(.fromBackend(backend, @intCast(seqlen), @intCast(config.text_config.num_attention_heads))),
+            .prefill_attention_parameters = .init(.fromBackend(backend)),
+            .decode_attention_parameters = .init(.fromBackend(backend)),
             .seqlen = seqlen,
             .shardings = shardings,
         };
@@ -42,6 +49,7 @@ pub const Args = struct {
     token_index_buf: *zml.Buffer,
     kv_cache_buffers: *zml.Bufferized(model.KvCache),
     rng_buffers: *zml.Bufferized(zml.Tensor.Rng),
+    attention_metadata_buffers: *zml.Bufferized(attention.Metadata),
 };
 
 pub const CompiledModel = struct {
@@ -68,6 +76,7 @@ pub const CompiledModel = struct {
                 qwen_model,
                 parameters,
                 @intCast(parameters.prefill_tokens.dim(.s)),
+                parameters.prefill_attention_parameters,
                 .prefill,
                 progress,
             ),
@@ -78,6 +87,7 @@ pub const CompiledModel = struct {
                 qwen_model,
                 parameters,
                 @intCast(parameters.decode_tokens.dim(.s)),
+                parameters.decode_attention_parameters,
                 .decode,
                 progress,
             ),
@@ -273,11 +283,12 @@ pub const KernelExe = struct {
         qwen_model: model.Model,
         parameters: CompilationOptions,
         seqlen: usize,
+        attention_parameters: attention.Parameters,
         phase: Phase,
         progress: *std.Progress.Node,
     ) !KernelExe {
         return .{
-            .composed = try .init(allocator, io, platform, qwen_model, parameters, seqlen, phase, progress),
+            .composed = try .init(allocator, io, platform, qwen_model, parameters, seqlen, attention_parameters, phase, progress),
         };
     }
 
@@ -326,6 +337,7 @@ const ComposedKernelExe = struct {
         qwen_model: model.Model,
         parameters: CompilationOptions,
         seqlen: usize,
+        attention_parameters: attention.Parameters,
         phase: Phase,
         progress: *std.Progress.Node,
     ) !ComposedKernelExe {
@@ -334,7 +346,7 @@ const ComposedKernelExe = struct {
 
         const full_attention_layer: ?zml.Exe = b: {
             const index = ComposedKernelExe.findFirstLayerIndex(qwen_model.config.text_config.layer_types, .full_attention) orelse break :b null;
-            break :b try ComposedKernelExe.compileFullAttentionLayer(allocator, io, platform, qwen_model, parameters, seqlen, index, phase, progress);
+            break :b try ComposedKernelExe.compileFullAttentionLayer(allocator, io, platform, qwen_model, parameters, seqlen, attention_parameters, index, phase, progress);
         };
         errdefer if (full_attention_layer) |exe| exe.deinit();
 
@@ -441,7 +453,7 @@ const ComposedKernelExe = struct {
                     .v = args.kv_cache_buffers.self_attn.v,
                     .layer_index = layer_index_buf.*,
                 };
-                exe_args.set(.{ hidden_buf, args.token_index_buf, layer_cache });
+                exe_args.set(.{ hidden_buf, args.token_index_buf, layer_cache, args.attention_metadata_buffers.* });
                 (self.full_attention_layer orelse unreachable).call(exe_args.*, results);
 
                 var new_hidden, var new_cache = results.get(struct {
@@ -596,6 +608,7 @@ const ComposedKernelExe = struct {
         qwen_model: model.Model,
         parameters: CompilationOptions,
         seqlen: usize,
+        attention_parameters: attention.Parameters,
         layer_index: usize,
         phase: Phase,
         progress: *std.Progress.Node,
@@ -619,7 +632,13 @@ const ComposedKernelExe = struct {
             io,
             qwen_model.text_model.layers[layer_index],
             .forwardSelfAttn,
-            .{ hidden_tensor, parameters.token_index, self_attn_cache },
+            .{
+                hidden_tensor,
+                parameters.token_index,
+                self_attn_cache,
+                parameters.attention_metadata,
+                attention_parameters,
+            },
             .{
                 .shardings = &parameters.shardings.all(),
                 .program_name = phase.programName("qwen3_5", "full_attention_layer"),

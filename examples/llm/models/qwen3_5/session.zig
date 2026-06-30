@@ -14,6 +14,7 @@ pub const Session = struct {
     decode_runner: inference.KernelExe.Runner,
     kv_cache_buffers: zml.Bufferized(model.KvCache),
     rng_buffers: zml.Bufferized(zml.Tensor.Rng),
+    attention_metadata_buffers: zml.Bufferized(zml.attention.attention.Metadata),
     tokenizer: zml.tokenizer.Tokenizer,
     generated_token_slice: zml.Slice,
     seqlen: u32,
@@ -37,6 +38,9 @@ pub const Session = struct {
         var rng_buffers = try zml.Tensor.Rng.initBuffer(io, platform, .replicated, seed);
         errdefer zml.Tensor.Rng.deinitBuffer(&rng_buffers);
 
+        var attention_metadata_buffers = try compiled_model.params.attention_metadata.initBuffer(io, platform, compiled_model.params.shardings.model);
+        errdefer zml.attention.attention.Metadata.deinitBuffer(&attention_metadata_buffers);
+
         var decode_runner = try compiled_model.decode.initRunner(
             allocator,
             io,
@@ -54,6 +58,7 @@ pub const Session = struct {
             .decode_runner = decode_runner,
             .kv_cache_buffers = kv_cache_buffers,
             .rng_buffers = rng_buffers,
+            .attention_metadata_buffers = attention_metadata_buffers,
             .tokenizer = tokenizer,
             .generated_token_slice = try .alloc(allocator, zml.Shape.init(.{ .b = 1, .s = 1 }, .u32)),
             .seqlen = compiled_model.params.seqlen,
@@ -68,6 +73,7 @@ pub const Session = struct {
         self.decode_runner.deinit(self.allocator);
         model.KvCache.deinitBuffer(&self.kv_cache_buffers);
         zml.Tensor.Rng.deinitBuffer(&self.rng_buffers);
+        zml.attention.attention.Metadata.deinitBuffer(&self.attention_metadata_buffers);
         self.generated_token_slice.free(self.allocator);
     }
 
@@ -103,6 +109,7 @@ pub const Session = struct {
             .token_index_buf = &prefill_token_index_buffer,
             .kv_cache_buffers = &self.kv_cache_buffers,
             .rng_buffers = &self.rng_buffers,
+            .attention_metadata_buffers = &self.attention_metadata_buffers,
         });
 
         try prefill_tokens_buffer.toSlice(self.io, prefill_tokens_slice);
@@ -150,6 +157,7 @@ pub const Session = struct {
                 .token_index_buf = &token_index_buffer,
                 .kv_cache_buffers = &self.kv_cache_buffers,
                 .rng_buffers = &self.rng_buffers,
+                .attention_metadata_buffers = &self.attention_metadata_buffers,
             });
 
             try current_token_buffer.toSlice(self.io, self.generated_token_slice);

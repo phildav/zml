@@ -122,8 +122,7 @@ pub const LoadedModel = struct {
         seqlen: usize,
         progress: *std.Progress.Node,
     ) !inference.CompiledModel {
-        _ = backend;
-        const params = inference.CompilationParameters.init(self.inner, self.parsed_config.value, @intCast(seqlen), shardings);
+        const params = inference.CompilationParameters.init(self.inner, self.parsed_config.value, @intCast(seqlen), backend, shardings);
         return inference.CompiledModel.init(allocator, io, platform, self, self.inner, params, progress);
     }
 };
@@ -209,9 +208,17 @@ pub const Model = struct {
         token_index: zml.Tensor,
         kv_cache: KvCache,
         rng: zml.Tensor.Rng,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
     ) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
         const tokens = tokens_.withPartialTags(.{.s});
-        const text_model_output, const updated_kv_cache = self.text_model.forward(tokens, token_index, kv_cache);
+        const text_model_output, const updated_kv_cache = self.text_model.forward(
+            tokens,
+            token_index,
+            kv_cache,
+            attention_metadata,
+            attention_parameters,
+        );
         const new_tokens, const new_rng, _ = self.sampler().sampleTokens(text_model_output, rng, null);
         return .{ new_tokens.convert(tokens.dtype()).reuseBuffer(tokens), updated_kv_cache, new_rng };
     }
@@ -288,12 +295,20 @@ pub const TextModel = struct {
         tokens: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
     ) struct { zml.Tensor, KvCache } {
         var hidden_states = self.embed_tokens.weight.gather(.{ .voc = tokens }, .{});
 
         var updated_kv_cache = kv_cache;
         for (self.layers, 0..) |layer, i| {
-            hidden_states, updated_kv_cache = layer.forward(hidden_states, token_index, updated_kv_cache.atLayer(i));
+            hidden_states, updated_kv_cache = layer.forward(
+                hidden_states,
+                token_index,
+                updated_kv_cache.atLayer(i),
+                attention_metadata,
+                attention_parameters,
+            );
         }
 
         return .{ hidden_states, updated_kv_cache.reuseBuffer(kv_cache) };
@@ -340,7 +355,9 @@ pub const TransformerLayer = struct {
         x0: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache.LayerView,
-    ) struct { zml.Tensor, KvCache } {
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
+    ) struct { zml.Tensor, KvCache} {
         const x0_replicated = x0.withPartitioning(.{ .d = .replicated });
         const normalized_x0 = self.input_layernorm.forward(x0_replicated);
 
@@ -352,7 +369,13 @@ pub const TransformerLayer = struct {
                     .self_attn => |cache| cache,
                     .linear_attn => unreachable,
                 };
-                const result = self_attn.forward(normalized_x0, token_index, cache);
+                const result = self_attn.forward(
+                    normalized_x0,
+                    token_index,
+                    cache,
+                    attention_metadata,
+                    attention_parameters,
+                );
                 attention_output = result[0];
                 updated_kv_cache.self_attn = result[1].reuseBuffer(updated_kv_cache.self_attn);
             },
@@ -366,13 +389,12 @@ pub const TransformerLayer = struct {
                 updated_kv_cache.gated_delta_net = result[1].reuseBuffer(updated_kv_cache.gated_delta_net);
             },
         }
-
         const x1 = attention_output.add(x0_replicated).withPartitioning(.{ .d = .replicated });
         const normalized_hidden = self.post_attention_layernorm.forward(x1);
 
         const mlp_output = self.mlp.forward(normalized_hidden).withPartitioning(.{ .d = .replicated });
 
-        return .{ mlp_output.add(x1).withPartitioning(.{ .d = .replicated }).reuseBuffer(x0), updated_kv_cache };
+        return .{ mlp_output.add(x1).withPartitioning(.{ .d = .replicated }).reuseBuffer(x0), updated_kv_cache};
     }
 
     pub fn forwardSelfAttn(
@@ -380,6 +402,8 @@ pub const TransformerLayer = struct {
         x0: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache.SelfAttnCache,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
     ) struct { zml.Tensor, KvCache.SelfAttnCache } {
         const x0_replicated = x0.withPartitioning(.{ .d = .replicated });
         const normalized_x0 = self.input_layernorm.forward(x0_replicated);
@@ -388,7 +412,13 @@ pub const TransformerLayer = struct {
             .full_attention => |self_attn| self_attn,
             .linear_attention => unreachable,
         };
-        const attention_output, const updated_kv_cache = self_attn.forward(normalized_x0, token_index, kv_cache);
+        const attention_output, const updated_kv_cache = self_attn.forward(
+            normalized_x0,
+            token_index,
+            kv_cache,
+            attention_metadata,
+            attention_parameters,
+        );
 
         const x1 = attention_output.add(x0_replicated).withPartitioning(.{ .d = .replicated });
         const normalized_hidden = self.post_attention_layernorm.forward(x1);
@@ -536,10 +566,10 @@ pub const SelfAttn = struct {
         return .{ k, v };
     }
 
-    fn partitionProjectedKv(kv: zml.Tensor, kv_head_sharding: zml.Sharding.DimSharding) zml.Tensor {
+    fn partitionProjectedKv(kv: zml.Tensor, kv_head_sharding: zml.Sharding.DimSharding, replicate_kv: bool) zml.Tensor {
         return switch (kv_head_sharding) {
             .sharded => |heads| blk: {
-                const sharded_kv = if (heads.factor != 1) kv.stutter1d(kv.axis(.h), heads.factor) else kv;
+                const sharded_kv = if (replicate_kv and heads.factor != 1) kv.stutter1d(kv.axis(.h), heads.factor) else kv;
                 break :blk sharded_kv.withPartitioning(.{ .s = .replicated, .h = .model, .hd = .replicated });
             },
             .replicated => kv.withPartitioning(.{ .s = .replicated, .h = .replicated, .hd = .replicated }),
@@ -564,6 +594,8 @@ pub const SelfAttn = struct {
         x: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache.SelfAttnCache,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
     ) struct { zml.Tensor, KvCache.SelfAttnCache } {
         const x_qkv = x.withPartitioning(.{ .d = .replicated });
 
@@ -575,8 +607,8 @@ pub const SelfAttn = struct {
             q.dim(.h),
         ) catch unreachable;
 
-        k = partitionProjectedKv(k, kv_head_sharding);
-        v = partitionProjectedKv(v, kv_head_sharding);
+        k = partitionProjectedKv(k, kv_head_sharding, true);
+        v = partitionProjectedKv(v, kv_head_sharding, true);
         q = self.q_norm.forward(q.rename(.{ .hd = .d })).rename(.{ .d = .hd });
         k = self.k_norm.forward(k.rename(.{ .hd = .d })).rename(.{ .d = .hd });
 
@@ -588,8 +620,8 @@ pub const SelfAttn = struct {
         const cos, const sin = self.rotary_embed.getCosAndSin(position_ids, dtype);
         q = self.rotary_embed.applyRope(q, cos, sin);
         k = self.rotary_embed.applyRope(k, cos, sin);
-        k = partitionProjectedKv(k, kv_head_sharding);
-        v = partitionProjectedKv(v, kv_head_sharding);
+        k = partitionProjectedKv(k, kv_head_sharding, false);
+        v = partitionProjectedKv(v, kv_head_sharding, false);
 
         const new_kv_cache = kv_cache.update(k, v, token_index.convert(.u32));
         k = new_kv_cache.keys().convert(dtype);
@@ -598,15 +630,31 @@ pub const SelfAttn = struct {
         k = partitionCachedKv(k, kv_head_sharding);
         v = partitionCachedKv(v, kv_head_sharding);
 
-        const attn_output = zml.attention.attention.attention(
-            q,
-            k,
-            v,
-            token_index,
-            .{},
-            zml.attention.attention.Metadata.init(.fromBackend(.vanilla, x.dim(.s), self.num_heads)),
-            zml.attention.attention.Parameters.init(.fromBackend(.vanilla)),
-        ).rename(.{ .q = .s }).merge(.{ .d_out_proj = .{ .h, .hd } });
+        stdx.debug.assert(q.dim(.b) == 1, "Qwen3_5 attention currently expects batch size 1 for flash attention backend, got {}", .{q.dim(.b)});
+        log.info("attention_parameters: {}", .{attention_parameters});
+        const attn_output = switch (attention_parameters) {
+            .vanilla => zml.attention.attention.attention(
+                q,
+                k,
+                v,
+                token_index,
+                .{},
+                attention_metadata,
+                attention_parameters,
+            ).rename(.{ .q = .s })
+             .merge(.{ .d_out_proj = .{ .h, .hd } }),
+            else => zml.attention.attention.attention(
+                q.squeeze(.b),
+                k.squeeze(.b),
+                v.squeeze(.b),
+                token_index,
+                .{},
+                attention_metadata,
+                attention_parameters,
+            ).rename(.{ .q = .s })
+             .merge(.{ .d_out_proj = .{ .h, .hd } })
+             .insertAxes(.s, .{.b}),
+        };
 
         const gated_output = attn_output.mul(gate.sigmoid());
         const projected_output = self.o_proj
